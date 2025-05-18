@@ -109,7 +109,7 @@ enum HttpCode {
 }
 
 impl HttpCode {
-    fn to_tcp_format(self) -> &'static str {
+    fn to_tcp_format(&self) -> &'static str {
         match self {
             HttpCode::Ok => "200 OK",
             HttpCode::NotFound => "404 Not Found",
@@ -123,14 +123,15 @@ impl HttpCode {
 struct Response {
     pub http_code: HttpCode,
     pub headers: HashMap<String, String>,
-    pub content: String,
+    pub content: Option<String>,
 }
 
 impl Default for Response {
     fn default() -> Self {
         Self {
             http_code: HttpCode::Ok,
-            ..default()
+            headers: HashMap::new(),
+            content: None,
         }
     }
 }
@@ -138,6 +139,7 @@ impl Default for Response {
 impl Response {
 
     fn write_to_stream(self, mut stream: &TcpStream) -> Result<usize> {
+
         let mut stream_output = Vec::from([
             IoSlice::new(b"HTTP/1.1 "),
             IoSlice::new(self.http_code.to_tcp_format().as_bytes()),
@@ -152,7 +154,8 @@ impl Response {
         }
 
         stream_output.push(IoSlice::new(b"\r\n"));
-        stream_output.push(IoSlice::new(self.content.as_bytes()));
+
+        self.content.as_ref().map(|s| stream_output.push(IoSlice::new(s.as_bytes())));
 
         let write_result = stream.write_vectored(&stream_output);
         match write_result {
@@ -169,6 +172,8 @@ fn handle_connection(mut stream: TcpStream) {
     let reader = BufReader::new(&stream);
 
     // We should never be getting empting requests (at the moment at least..)
+    // TODO: Probably shouldn't crash on empty lines.
+    //   Enough concurrent requests is making this catch empty lines.
     let raw_stream = reader.lines().next().unwrap().unwrap();
     let request = Request::parse(&raw_stream).unwrap();
 
@@ -187,7 +192,7 @@ fn handle_connection(mut stream: TcpStream) {
                 let response = Response {
                     http_code: HttpCode::Ok,
                     headers,
-                    content: echo_word.to_owned()
+                    content: Some(echo_word.to_owned())
                 };
 
                 response.write_to_stream(&stream).unwrap();
