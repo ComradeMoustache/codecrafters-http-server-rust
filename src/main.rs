@@ -125,12 +125,65 @@ fn handle_connection(mut stream: TcpStream) {
         }
 
     }
-    // loop {
-    //     let result = stream.read_line(&mut buffer);
-    //     match result {
-    //         Ok(n) => println!("Recieved {} bytes", n),
-    //         _ => {}
-    //     }
+
+}
+
+
+#[allow(non_snake_case)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_request__basic_get_requests__ok() {
+        let mut test_request: &str = "GET /index.html HTTP/1.1\r\nHost: localhost:4221\r\nUser-Agent: curl/7.64.1\r\nAccept: */*\r\n\r\n";
+
+        let request = Request::parse(test_request).unwrap();
+
+        assert_eq!(request.path, "/index.html");
+        assert_eq!(request.method, HttpMethod::Get);
+        assert_eq!(request.http_version, "HTTP/1.1");
+
+        test_request = "GET / HTTP/1.1\r\nHost: localhost:4221\r\nUser-Agent: curl/7.64.1\r\nAccept: */*\r\n\r\n";
+        let request = Request::parse(test_request).unwrap();
+
+        assert_eq!(request.path, "/");
+        assert_eq!(request.method, HttpMethod::Get);
+        assert_eq!(request.http_version, "HTTP/1.1");
+
+    }
+
+    #[test]
+    fn test_parse_request__bad_method__fail() {
+        let test_request: &str = "POTATO /index.html HTTP/1.1\r\nHost: localhost:4221\r\nUser-Agent: curl/7.64.1\r\nAccept: */*\r\n\r\n";
+        assert!(Request::parse(test_request).is_err());
+    }
+
+    #[test]
+    fn test_parse_request__missing_values__fail() {
+        let mut test_request: &str = "GET /index.html ";
+        assert!(Request::parse(test_request).is_err());
+
+        test_request = "GET /index.html";
+        assert!(Request::parse(test_request).is_err());
+
+        test_request = " /index.html";
+        assert!(Request::parse(test_request).is_err());
+
+        test_request = " /index.html ";
+        assert!(Request::parse(test_request).is_err());
+
+        test_request = "GET ";
+        assert!(Request::parse(test_request).is_err());
+
+    }
+
+
+
+    // #[test]
+    // fn test_parse_method() {
+    //     let method = parse_method(&TEST_REQUEST_LINE.to_string()).unwrap();
+    //     assert_eq!(method, "GET");
     // }
 
 }
