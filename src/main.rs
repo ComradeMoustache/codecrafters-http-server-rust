@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path;
 
+use default::default;
 use anyhow::{anyhow, Result};
 
 fn main() {
@@ -41,6 +42,7 @@ impl HttpMethod {
             _ => Err(anyhow!("Could not parse {} into HttpMethod", method))
         }
     }
+
 }
 
 #[derive(Debug)]
@@ -103,10 +105,61 @@ enum HttpCode {
     BadRequest,
 }
 
+impl HttpCode {
+    fn to_tcp_format(self) -> &'static str {
+        match self {
+            HttpCode::Ok => "200 OK",
+            HttpCode::NotFound => "404 Not Found",
+            HttpCode::InternalServerError => "500 Internal Error",
+            HttpCode::BadRequest => "400 Bad Request",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Response {
-    pub response: HttpCode,
+    pub http_code: HttpCode,
+    pub headers: HashMap<String, String>,
     pub content: String,
+}
+
+impl Default for Response {
+    fn default() -> Self {
+        Self {
+            http_code: HttpCode::Ok,
+            ..default()
+        }
+    }
+}
+
+impl Response {
+
+    fn write_to_stream(self, mut stream: &TcpStream) -> Result<usize> {
+        let mut stream_output = Vec::from([
+            IoSlice::new(b"HTTP/1.1 "),
+            IoSlice::new(self.http_code.to_tcp_format().as_bytes()),
+            IoSlice::new(b"\r\n")]
+        );
+
+        for (k, v) in self.headers.iter() {
+            stream_output.push(IoSlice::new(k.as_bytes()));
+            stream_output.push(IoSlice::new(b": "));
+            stream_output.push(IoSlice::new(v.as_bytes()));
+            stream_output.push(IoSlice::new(b"\r\n"));
+        }
+
+        stream_output.push(IoSlice::new(b"\r\n"));
+        stream_output.push(IoSlice::new(self.content.as_bytes()));
+
+        let write_result = stream.write_vectored(&stream_output);
+        match write_result {
+            Ok(n) => {
+                println!("Sent {n} bytes back.");
+                Ok(n)
+            }
+            Err(err) => Err(anyhow!("Could not write response to stream: {}", err))
+        }
+    }
 }
 
 fn handle_connection(mut stream: TcpStream) {
@@ -118,10 +171,27 @@ fn handle_connection(mut stream: TcpStream) {
 
     match request.path {
         "/" => {
-            stream.write("HTTP/1.1 200 OK\r\n\r\n".as_bytes()).unwrap();
+            Response::default().write_to_stream(&stream).unwrap();
         }
-        _ => {
-            stream.write("HTTP/1.1 404 Not Found\r\n\r\n".as_bytes()).unwrap();
+        path => {
+            if path.starts_with("/echo") {
+                let echo_word = path[1..].split_once('/').unwrap().1;
+
+                let mut headers: HashMap<String, String> = HashMap::new();
+                headers.insert("Content-Type".into(), "text/plain".into());
+                headers.insert("Content-Lengith".into(), format!("{}", echo_word.len()));
+
+                let response = Response {
+                    http_code: HttpCode::Ok,
+                    headers,
+                    content: echo_word.to_owned()
+                };
+
+                response.write_to_stream(&stream).unwrap();
+
+            } else {
+                stream.write("HTTP/1.1 404 Not Found\r\n\r\n".as_bytes()).unwrap();
+            }
         }
 
     }
