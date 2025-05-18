@@ -179,7 +179,7 @@ fn handle_connection(mut stream: TcpStream) {
 
                 let mut headers: HashMap<String, String> = HashMap::new();
                 headers.insert("Content-Type".into(), "text/plain".into());
-                headers.insert("Content-Lengith".into(), format!("{}", echo_word.len()));
+                headers.insert("Content-Length".into(), format!("{}", echo_word.len()));
 
                 let response = Response {
                     http_code: HttpCode::Ok,
