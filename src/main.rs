@@ -1,5 +1,9 @@
-use std::io::{Read, Write, BufRead};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path;
+
+use anyhow::{anyhow, Result};
 
 fn main() {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -11,9 +15,9 @@ fn main() {
 
     for stream in listener.incoming() {
         match stream {
-            Ok(mut stream) => {
+            Ok(stream) => {
                 //println!("accepted new connection");
-                handle_connection(&mut stream);
+                handle_connection(stream);
                 //println!("Returned 200 OK to {}", stream.peer_addr());
             }
             Err(e) => {
@@ -23,34 +27,96 @@ fn main() {
     }
 }
 
-enum RequestType {
-    Get
+#[derive(Debug, PartialEq, Eq)]
+enum HttpMethod {
+    Get,
+    Post,
 }
 
-struct RequestLine<'a> {
-    request_type: RequestType,
-    request_target: &'a str,
-    http_version: &'a str,
+impl HttpMethod {
+    fn parse(method: &str) -> Result<Self> {
+        match method {
+            "GET" => Ok(Self::Get),
+            "POST" => Ok(Self::Post),
+            _ => Err(anyhow!("Could not parse {} into HttpMethod", method))
+        }
+    }
 }
 
-fn handle_connection(stream: &mut TcpStream) {
-    // Seems like the stream reader only works with bytes
-    let mut buffer = [0; 512];
-    //let mut buffer = String::new();
-    // let mut buffer: Vec<> = ;
-    println!("here");
-    _ = stream.read(&mut buffer).unwrap();
-    //let mut new_stream = stream.read(buffer);
-    //new_stream.read_to_string(&mut buffer).unwrap();
+#[derive(Debug)]
+struct Request<'a> {
+    pub method: HttpMethod,
+    pub path: &'a str,
+    pub http_version: &'a str,
+    // Host: localhost
+    pub headers: HashMap<&'a str, &'a str>,
+    pub body: Option<&'a str>,
+}
 
-    let request = String::from_utf8(buffer.into()).unwrap();
-    println!("{:?}", request);
-    println!("{:?}", request.split("\r\n").next().unwrap());
-    let request_line = request.split("\r\n").next().unwrap();
-    let path = request_line.split(' ').nth(1).unwrap();
-    println!("{:?}", path);
+fn valid_path(path: &str) -> bool {
+    true
+}
 
-    match path {
+impl<'a> Request<'a> {
+    fn parse(request_line: &'a str) -> Result<Self> {
+        let mut request_split = request_line.split_whitespace();
+        let method = {
+            let method_str = request_split.next().ok_or(anyhow!("Couldn't parse request method. No data to parse."))?;
+            HttpMethod::parse(&method_str)?
+        };
+
+        let path = {
+            let path_str = request_split.next().ok_or(
+                anyhow!("Couldn't get path from request. Http requests should be space separated, e.g. `<method> <path> <http_version>`, but no space was found."
+            ))?;
+            if !valid_path(path_str) {
+                return Err(anyhow!("Path {} is not valid", path_str))
+            };
+            path_str
+        };
+
+        let http_version = {
+            let version = request_split.next().ok_or(
+                anyhow!("Couldn't get http version from request. Http requests should be space separated, e.g. `<method> <path> <http_version>`, but there was no 3rd element when space separating."
+            ))?;
+            match version {
+                "HTTP/1.1" => version,
+                _ => return Err(anyhow!("Bad HTTP version: {}", version))
+            }
+        };
+
+        Ok(Self {
+            method,
+            path,
+            http_version,
+            headers: HashMap::new(),
+            body: None,
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HttpCode {
+    Ok,
+    NotFound,
+    InternalServerError,
+    BadRequest,
+}
+
+#[derive(Debug)]
+struct Response {
+    pub response: HttpCode,
+    pub content: String,
+}
+
+fn handle_connection(mut stream: TcpStream) {
+    let reader = BufReader::new(&stream);
+
+    // We should never be getting empting requests (at the moment at least..)
+    let raw_stream = reader.lines().next().unwrap().unwrap();
+    let request = Request::parse(&raw_stream).unwrap();
+
+    match request.path {
         "/" => {
             stream.write("HTTP/1.1 200 OK\r\n\r\n".as_bytes()).unwrap();
         }
