@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::thread;
 use std::io::{BufRead, BufReader, IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path;
@@ -18,7 +19,9 @@ fn main() {
         match stream {
             Ok(stream) => {
                 //println!("accepted new connection");
-                handle_connection(stream);
+                thread::spawn(|| {
+                    handle_connection(stream)
+                });
                 //println!("Returned 200 OK to {}", stream.peer_addr());
             }
             Err(e) => {
