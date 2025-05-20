@@ -1,31 +1,42 @@
+use clap::Parser;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path;
+use std::sync::Arc;
 use std::thread;
+use std::{fs, path};
 
 use anyhow::{anyhow, Result};
 use default::default;
+
+#[derive(Parser)]
+struct Cli {
+    #[arg(long)]
+    directory: Option<std::path::PathBuf>,
+}
 
 fn main() {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
     println!("Logs from your program will appear here!");
 
     // Uncomment this block to pass the first stage
+    let config = Cli::parse();
 
     let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                println!("accepted new connection: {:?}", stream.peer_addr());
-                thread::spawn(|| handle_connection(stream));
-            }
-            Err(e) => {
-                println!("error: {}", e);
+    std::thread::scope(|scope| {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    println!("accepted new connection: {:?}", stream.peer_addr());
+                    scope.spawn(|| handle_connection(stream, &config));
+                }
+                Err(e) => {
+                    println!("error: {}", e);
+                }
             }
         }
-    }
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -90,7 +101,7 @@ impl Request {
                 _ => return Err(anyhow!("Bad HTTP version: {}", version)),
             }
         };
-        
+
         let mut headers: HashMap<String, String> = HashMap::new();
 
         // Keep reading until we get an empty line
@@ -184,48 +195,76 @@ impl Response {
     }
 }
 
-fn handle_connection(mut stream: TcpStream) {
+fn handle_connection(stream: TcpStream, config: &Cli) {
     let request = Request::from_stream(&stream).unwrap();
+
+    let mut response = Response {
+        http_code: HttpCode::Ok,
+        headers: HashMap::new(),
+        content: None
+    };
 
     match request.path.as_str() {
         "/" => {
-            Response::default().write_to_stream(&stream).unwrap();
         },
         path => {
             if path.starts_with("/echo") {
                 let echo_word = path[1..].split_once('/').unwrap().1;
 
-                let mut headers: HashMap<String, String> = HashMap::new();
-                headers.insert("Content-Type".into(), "text/plain".into());
-                headers.insert("Content-Length".into(), format!("{}", echo_word.len()));
+                response.headers.insert("Content-Type".into(), "text/plain".into());
+                response.headers.insert("Content-Length".into(), format!("{}", echo_word.len()));
 
-                let response = Response {
-                    http_code: HttpCode::Ok,
-                    headers,
-                    content: Some(echo_word.to_owned()),
-                };
+                response.content = Some(echo_word.to_owned());
 
-                response.write_to_stream(&stream).unwrap();
             } else if path.starts_with("/user-agent") {
 
-                let mut headers: HashMap<String, String> = HashMap::new();
+                response.headers.insert("Content-Type".into(), "text/plain".into());
+                response.headers.insert(
+                    "Content-Length".into(),
+                    format!("{}", request.headers.get("User-Agent").unwrap().len()),
+                );
 
-                headers.insert("Content-Type".into(), "text/plain".into());
-                headers.insert("Content-Length".into(), format!("{}", request.headers.get("User-Agent").unwrap().len()));
+                response.content = Some(request.headers.get("User-Agent").unwrap().to_owned());
 
-                let response = Response {
-                    http_code: HttpCode::Ok,
-                    headers,
-                    content: Some(request.headers.get("User-Agent").unwrap().to_owned()),
+            } else if path.starts_with("/files") {
+
+                let path_split = path[1..].split_once('/');
+
+                match path_split {
+                    Some((_, file_name)) => {
+                        match &config.directory {
+                            Some(dir) => {
+
+                                // Get file
+                                match fs::read_to_string(format!("{}{}", dir.display(), file_name)) {
+                                    Ok(data) => {
+                                        response.headers.insert("Content-Type".into(), "application/octet-stream".into());
+                                        response.headers.insert(
+                                            "Content-Length".into(),
+                                            format!("{}", data.len()),
+                                        );
+                                        response.content = Some(data)
+                                    },
+                                    Err(_) => {
+                                        response.http_code = HttpCode::NotFound
+                                    },
+                                };
+
+                            },
+                            None => response.http_code = HttpCode::BadRequest,
+                        }
+
+                    }
+                    None => {
+                        response.http_code = HttpCode::Ok;
+                    }
                 };
-
-                response.write_to_stream(&stream).unwrap();
-
             } else {
-                stream
-                    .write("HTTP/1.1 404 Not Found\r\n\r\n".as_bytes())
-                    .unwrap();
+                response.http_code = HttpCode::NotFound
             }
         }
-    }
+    };
+
+    response.write_to_stream(&stream).unwrap();
+
 }
