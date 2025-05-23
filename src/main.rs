@@ -109,6 +109,12 @@ impl Request<'_> {
             .set_read_timeout(Some(Duration::from_secs(DEFAULT_TIMEOUT as u64)))
             .unwrap();
 
+        /*
+        Could look to use `.as_ref()` on the stream.
+
+        Doing `.as_ref()` will consume the iterator but won't take ownership of it. So 
+        it would allow me to do `.lines()` to get the header here.
+        */
         loop {
             returned_bytes = stream.read(&mut buffer)?;
             println!("Bytes returned: {}", returned_bytes);
