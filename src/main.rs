@@ -119,7 +119,7 @@ impl Request<'_> {
 
             request.push_str(std::str::from_utf8(&buffer[..returned_bytes]).unwrap());
 
-            if request.contains("\r\n\r\n") {
+            if request.contains(END_OF_HEADER) {
                 println!("End of header found.");
                 break;
             }
