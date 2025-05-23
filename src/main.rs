@@ -76,16 +76,14 @@ impl HttpMethod {
 }
 
 #[derive(Debug)]
-struct Request {
+struct Request<'a> {
     pub method: HttpMethod,
     pub path: String,
     pub http_version: String,
     pub headers: HashMap<String, String>,
     pub body: Option<String>,
-}
 
-fn valid_path(path: &str) -> bool {
-    true
+    vars: Option<HashMap<&'a str, &'a str>>
 }
 
 /*
@@ -99,7 +97,7 @@ header.
 
 */
 
-impl Request {
+impl Request<'_> {
     fn from_stream(mut stream: &TcpStream) -> Result<Self> {
         // 1KiB array
         let mut buffer = [0; 1024];
@@ -242,6 +240,7 @@ impl Request {
             http_version,
             headers,
             body: None,
+            vars: None,
         })
     }
 }
