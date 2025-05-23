@@ -1,13 +1,24 @@
 use clap::Parser;
+use core::panic;
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::{BufRead, BufReader, IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::process::exit;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 use std::{fs, path};
 
 use anyhow::{anyhow, Result};
 use default::default;
+
+const DEFAULT_TIMEOUT: u8 = 5; // seconds
+const END_OF_HEADER: &str = "\r\n\r\n";
+const CONTENT_TYPE_HEADER: &str = "Content-Type";
+const CONTENT_LENGTH_HEADER: &str = "Content-Length";
+const DEFAULT_FILES_DIR: &str = "/tmp/rust-http-server/";
 
 #[derive(Parser)]
 struct Cli {
@@ -20,7 +31,16 @@ fn main() {
     println!("Logs from your program will appear here!");
 
     // Uncomment this block to pass the first stage
-    let config = Cli::parse();
+    let mut config = Cli::parse();
+
+    match &config.directory {
+        None => config.directory = Some(DEFAULT_FILES_DIR.into()),
+        Some(dir) => {
+            if !dir.starts_with("/tmp/") {
+                panic!("Expecting server directory to be stored in /tmp/");
+            }
+        }
+    }
 
     let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
 
@@ -68,54 +88,153 @@ fn valid_path(path: &str) -> bool {
     true
 }
 
+/*
+
+I think that I can iterate through thet string until I get a buffer with `\r\n\r\n`
+which marks the end of the header. Then I need to pull in whatever is in Content-Length
+header.
+
+- Do post requests always have a Content-Length header?
+- Are headers always capitalised with dashes?
+
+*/
+
 impl Request {
-    fn from_stream(stream: &TcpStream) -> Result<Self> {
-        let reader = BufReader::new(stream);
-        let mut reader_lines = reader.lines();
-        let request_line = reader_lines.next().unwrap().unwrap();
+    fn from_stream(mut stream: &TcpStream) -> Result<Self> {
+        // 1KiB array
+        let mut buffer = [0; 1024];
+        let mut request = String::new();
+        let mut parsed_request: Request;
+        let mut returned_bytes: usize;
 
-        let mut request_split = request_line.split_whitespace();
-        let method = {
-            let method_str = request_split
-                .next()
-                .ok_or(anyhow!("Couldn't parse request method. No data to parse."))?;
-            HttpMethod::parse(&method_str)?
-        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(DEFAULT_TIMEOUT as u64)))
+            .unwrap();
 
-        let path = {
-            let path_str = request_split.next().ok_or(
-                anyhow!("Couldn't get path from request. Http requests should be space separated, e.g. `<method> <path> <http_version>`, but no space was found."
-            ))?;
-            if !valid_path(path_str) {
-                return Err(anyhow!("Path {} is not valid", path_str));
-            };
-            path_str.to_string()
-        };
+        loop {
+            returned_bytes = stream.read(&mut buffer)?;
+            println!("Bytes returned: {}", returned_bytes);
 
-        let http_version = {
-            let version = request_split.next().ok_or(
-                anyhow!("Couldn't get http version from request. Http requests should be space separated, e.g. `<method> <path> <http_version>`, but there was no 3rd element when space separating."
-            ))?;
-            match version {
-                "HTTP/1.1" => version.to_string(),
-                _ => return Err(anyhow!("Bad HTTP version: {}", version)),
+            if returned_bytes == 0 {
+                break;
             }
-        };
+
+            request.push_str(std::str::from_utf8(&buffer[..returned_bytes]).unwrap());
+
+            if request.contains("\r\n\r\n") {
+                println!("End of header found.");
+                break;
+            }
+        }
+
+        let start_string_length: usize;
+        // Get the string up to the end of the header.
+        if let Some((start_string, _)) = request.split_once(END_OF_HEADER) {
+            start_string_length = start_string.len();
+            parsed_request = Request::parse_up_to_header(&start_string)?;
+        } else {
+            return Err(anyhow!(
+                "Couldn't find end of header, data recieved: {}.",
+                request
+            ));
+        }
+
+        let content_length: usize;
+        // Now that I have a header, if there is a content-length header, keep reading
+        // the stream until the data has been completely read in.
+        if let Some(content_header_value) = parsed_request.headers.get("Content-Length") {
+            match content_header_value.parse::<usize>() {
+                Err(err) => {
+                    return Err(anyhow!(
+                        "Could not parse Content-Length header value `{}` to number, got error: {}",
+                        content_header_value,
+                        err
+                    ))
+                }
+                Ok(length) => {
+                    content_length = length;
+                }
+            }
+        } else {
+            eprintln!("No content length header set.");
+            return Ok(parsed_request);
+        }
+
+        while request.len() < (content_length + start_string_length + END_OF_HEADER.len()) {
+            returned_bytes = stream.read(&mut buffer)?;
+            println!("Bytes returned: {}", returned_bytes);
+
+            if returned_bytes == 0 {
+                break;
+            }
+
+            request.push_str(std::str::from_utf8(&buffer[..returned_bytes]).unwrap());
+        }
+
+        let (_, content) = request
+            .split_once(END_OF_HEADER)
+            .expect(format!("Could not find `{}` in string.", END_OF_HEADER).as_str());
+
+        if content_length == content.len() {
+            parsed_request.body = Some(content.into());
+            return Ok(parsed_request);
+        } else if content_length < content.len() {
+            return Err(anyhow!(
+                "More content data was sent, expected {} bytes but found {}",
+                content_length,
+                content.len()
+            ));
+        } else {
+            return Err(anyhow!(
+                "Not enough content data was sent, expected {} bytes but found {}",
+                content.len(),
+                content.len()
+            ));
+        }
+    }
+
+    fn parse_up_to_header(header_string: &str) -> Result<Self> {
+        let mut reader_lines = header_string.lines();
+        let method: HttpMethod;
+        let path: String;
+        let http_version: String;
+
+        if let Some(request_line) = reader_lines.next() {
+            let mut request_split = request_line.split_whitespace();
+
+            if let Some(method_str) = request_split.next() {
+                method = HttpMethod::parse(&method_str)?;
+            } else {
+                return Err(anyhow!("Failed to get http method, no data found."));
+            }
+
+            if let Some(path_str) = request_split.next() {
+                path = path_str.into();
+            } else {
+                return Err(anyhow!("Failed to get path, no more data found."));
+            }
+
+            if let Some(version_str) = request_split.next() {
+                http_version = version_str.into();
+            } else {
+                return Err(anyhow!("Failed to get version, no more data found."));
+            }
+        } else {
+            return Err(anyhow!("Failed to parse request, no data found."));
+        }
 
         let mut headers: HashMap<String, String> = HashMap::new();
 
-        // Keep reading until we get an empty line
-        let _ = reader_lines
-            .take_while(|x| match x {
-                Ok(v) => v != "",
-                _ => false,
-            })
-            .map(|x| {
-                let inner: String = x.ok().unwrap();
-                let header_split = inner.split_once(": ").unwrap();
-                headers.insert(header_split.0.to_string(), header_split.1.to_string());
-            })
-            .collect::<Vec<_>>();
+        for header in reader_lines {
+            if let Some((header_key, header_value)) = header.split_once(": ") {
+                headers.insert(header_key.into(), header_value.into());
+            } else {
+                return Err(anyhow!(
+                    "Failed to parse header, values should be separated with `: `, got: {}.",
+                    header
+                ));
+            }
+        }
 
         Ok(Self {
             method,
@@ -133,6 +252,7 @@ enum HttpCode {
     NotFound,
     InternalServerError,
     BadRequest,
+    Created,
 }
 
 impl HttpCode {
@@ -142,6 +262,7 @@ impl HttpCode {
             HttpCode::NotFound => "404 Not Found",
             HttpCode::InternalServerError => "500 Internal Error",
             HttpCode::BadRequest => "400 Bad Request",
+            HttpCode::Created => "201 Created",
         }
     }
 }
@@ -201,70 +322,184 @@ fn handle_connection(stream: TcpStream, config: &Cli) {
     let mut response = Response {
         http_code: HttpCode::Ok,
         headers: HashMap::new(),
-        content: None
+        content: None,
     };
 
-    match request.path.as_str() {
-        "/" => {
-        },
-        path => {
-            if path.starts_with("/echo") {
-                let echo_word = path[1..].split_once('/').unwrap().1;
+    match request.method {
+        HttpMethod::Get => {
+            match request.path.as_str() {
+                "/" => {}
+                path => {
+                    if path.starts_with("/echo") {
+                        let echo_word = path[1..].split_once('/').unwrap().1;
 
-                response.headers.insert("Content-Type".into(), "text/plain".into());
-                response.headers.insert("Content-Length".into(), format!("{}", echo_word.len()));
+                        response
+                            .headers
+                            .insert("Content-Type".into(), "text/plain".into());
+                        response
+                            .headers
+                            .insert("Content-Length".into(), format!("{}", echo_word.len()));
 
-                response.content = Some(echo_word.to_owned());
+                        response.content = Some(echo_word.to_owned());
+                    } else if path.starts_with("/user-agent") {
+                        response
+                            .headers
+                            .insert("Content-Type".into(), "text/plain".into());
+                        response.headers.insert(
+                            "Content-Length".into(),
+                            format!("{}", request.headers.get("User-Agent").unwrap().len()),
+                        );
 
-            } else if path.starts_with("/user-agent") {
+                        response.content =
+                            Some(request.headers.get("User-Agent").unwrap().to_owned());
+                    } else if path.starts_with("/files") {
+                        let path_split = path[1..].split_once('/');
 
-                response.headers.insert("Content-Type".into(), "text/plain".into());
-                response.headers.insert(
-                    "Content-Length".into(),
-                    format!("{}", request.headers.get("User-Agent").unwrap().len()),
-                );
+                        match path_split {
+                            Some((_, file_name)) => {
+                                match &config.directory {
+                                    Some(dir) => {
+                                        // Get file
+                                        match fs::read_to_string(format!(
+                                            "{}{}",
+                                            dir.display(),
+                                            file_name
+                                        )) {
+                                            Ok(data) => {
+                                                response.headers.insert(
+                                                    "Content-Type".into(),
+                                                    "application/octet-stream".into(),
+                                                );
+                                                response.headers.insert(
+                                                    "Content-Length".into(),
+                                                    format!("{}", data.len()),
+                                                );
+                                                response.content = Some(data)
+                                            }
+                                            Err(_) => response.http_code = HttpCode::NotFound,
+                                        };
+                                    }
+                                    None => {
+                                        eprintln!("CRITICAL: No files directory was set!");
+                                        response.http_code = HttpCode::InternalServerError;
+                                    }
+                                }
+                            }
+                            None => {
+                                response.http_code = HttpCode::Ok;
+                            }
+                        };
+                    } else {
+                        response.http_code = HttpCode::NotFound
+                    }
+                }
+            };
+        }
+        HttpMethod::Post => {
+            if request.path.as_str().starts_with("/files") {
+                let path_split = request.path[1..].split_once("/");
+                if let Some(content_type) = request.headers.get(CONTENT_TYPE_HEADER) {
+                    if content_type != "application/octet-stream" {
+                        response.http_code = HttpCode::BadRequest;
+                        let response_msg = format!(
+                            "Unsupported content type `{}` expected `application/octet-stream`",
+                            content_type
+                        );
+                        response
+                            .headers
+                            .insert(CONTENT_LENGTH_HEADER.into(), response_msg.len().to_string());
+                        response.content = Some(response_msg.into());
+                    }
+                } else {
+                    response.http_code = HttpCode::BadRequest;
+                    let response_msg = "Expected content type header but got nothing.";
+                    response
+                        .headers
+                        .insert(CONTENT_LENGTH_HEADER.into(), response_msg.len().to_string());
+                    response.content = Some(response_msg.into());
+                }
 
-                response.content = Some(request.headers.get("User-Agent").unwrap().to_owned());
+                if response.http_code != HttpCode::BadRequest {
+                    if let Some(content_length) = request.headers.get(CONTENT_LENGTH_HEADER) {
+                        debug_assert_eq!(
+                            content_length.parse::<usize>().unwrap(),
+                            request.body.to_owned().unwrap().len()
+                        );
+                    } else {
+                        response.http_code = HttpCode::BadRequest;
+                        let response_msg = format!("Missing {} header", CONTENT_LENGTH_HEADER);
+                        response
+                            .headers
+                            .insert(CONTENT_LENGTH_HEADER.into(), response_msg.len().to_string());
+                        response.content = Some(response_msg.into());
+                    }
+                }
 
-            } else if path.starts_with("/files") {
-
-                let path_split = path[1..].split_once('/');
-
-                match path_split {
-                    Some((_, file_name)) => {
-                        match &config.directory {
-                            Some(dir) => {
-
-                                // Get file
-                                match fs::read_to_string(format!("{}{}", dir.display(), file_name)) {
-                                    Ok(data) => {
-                                        response.headers.insert("Content-Type".into(), "application/octet-stream".into());
-                                        response.headers.insert(
-                                            "Content-Length".into(),
-                                            format!("{}", data.len()),
-                                        );
-                                        response.content = Some(data)
-                                    },
-                                    Err(_) => {
-                                        response.http_code = HttpCode::NotFound
-                                    },
-                                };
-
-                            },
-                            None => response.http_code = HttpCode::BadRequest,
+                if response.http_code != HttpCode::BadRequest {
+                    match path_split {
+                        Some((_, file_name)) => {
+                            match &config.directory {
+                                Some(dir) => {
+                                    // Get file
+                                    let mut filepath = dir.clone();
+                                    filepath.push(file_name);
+                                    println!("Not mutated {:?}", dir);
+                                    match File::create_new(filepath) {
+                                        Ok(mut file) => {
+                                            match file.write_all(
+                                                request
+                                                    .body
+                                                    .expect("No file data to upload.")
+                                                    .as_bytes(),
+                                            ) {
+                                                Ok(_) => {
+                                                    response.http_code = HttpCode::Created;
+                                                }
+                                                Err(err) => {
+                                                    eprintln!(
+                                                        "Failed to load file to {}, got error: {}",
+                                                        file_name,
+                                                        err
+                                                    );
+                                                    response.http_code =
+                                                        HttpCode::InternalServerError;
+                                                }
+                                            }
+                                        }
+                                        Err(err) => match err.kind() {
+                                            std::io::ErrorKind::AlreadyExists => {
+                                                response.http_code = HttpCode::BadRequest;
+                                                let response_msg =
+                                                    format!("File {} already exists.", file_name);
+                                                response.headers.insert(
+                                                    CONTENT_LENGTH_HEADER.into(),
+                                                    response_msg.len().to_string(),
+                                                );
+                                                response.content = Some(response_msg.into());
+                                            }
+                                            _ => {
+                                                eprintln!("CRITICAL: Could upload a user's file due to an internal server error: {}", err);
+                                                response.http_code = HttpCode::InternalServerError;
+                                            }
+                                        },
+                                    }
+                                }
+                                None => {
+                                    eprintln!("CRITICAL: No files directory was set!");
+                                    response.http_code = HttpCode::InternalServerError;
+                                }
+                            }
                         }
-
+                        None => {
+                            response.http_code = HttpCode::BadRequest;
+                            response.content = Some("No file name sent in url, url should be formatted like /files/<file_name>".into());
+                        }
                     }
-                    None => {
-                        response.http_code = HttpCode::Ok;
-                    }
-                };
+                }
             } else {
-                response.http_code = HttpCode::NotFound
+                response.http_code = HttpCode::BadRequest;
             }
         }
-    };
-
+    }
     response.write_to_stream(&stream).unwrap();
-
 }
