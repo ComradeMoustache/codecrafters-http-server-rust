@@ -1,18 +1,13 @@
 use clap::Parser;
 use core::panic;
-use std::collections::HashMap;
+use std::collections::{HashMap};
 use std::fs::File;
-use std::io::{BufRead, BufReader, IoSlice, Read, Write};
+use std::io::{IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
-use std::process::exit;
-use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
-use std::{fs, path};
+use std::fs;
 
 use anyhow::{anyhow, Result};
-use default::default;
 
 const DEFAULT_TIMEOUT: u8 = 5; // seconds
 const END_OF_HEADER: &str = "\r\n\r\n";
