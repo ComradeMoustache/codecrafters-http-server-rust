@@ -1,4 +1,6 @@
 use clap::Parser;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use core::panic;
 use std::collections::{HashMap};
 use std::fs::File;
@@ -12,6 +14,7 @@ use anyhow::{anyhow, Result};
 const DEFAULT_TIMEOUT: u8 = 5; // seconds
 const END_OF_HEADER: &str = "\r\n\r\n";
 const CONTENT_TYPE_HEADER: &str = "Content-Type";
+const CONTENT_ENCODING_HEADER: &str = "Content-Encoding";
 const CONTENT_LENGTH_HEADER: &str = "Content-Length";
 const DEFAULT_FILES_DIR: &str = "/tmp/rust-http-server/";
 
@@ -271,7 +274,7 @@ impl HttpCode {
 struct Response {
     pub http_code: HttpCode,
     pub headers: HashMap<String, String>,
-    pub content: Option<String>,
+    pub content: Option<Vec<u8>>,
 }
 
 impl Default for Response {
@@ -303,7 +306,7 @@ impl Response {
 
         self.content
             .as_ref()
-            .map(|s| stream_output.push(IoSlice::new(s.as_bytes())));
+            .map(|s| stream_output.push(IoSlice::new(s)));
 
         let write_result = stream.write_vectored(&stream_output);
         match write_result {
@@ -315,6 +318,26 @@ impl Response {
         }
     }
 }
+
+fn output_middleware(request: &Request, mut response: Response) -> Response {
+    if let Some(encoding) = request.headers.get("Accept-Encoding") {
+        if encoding == "gzip" {
+            // response.headers.insert("Content-Type".into(), "text/plain".into());
+            let mut compressed_content = GzEncoder::new(Vec::new(), Compression::default());
+            if let Some(content) = &response.content {
+                compressed_content.write_all(content).unwrap();
+                let c = compressed_content.finish().unwrap();
+                println!("Compressed len: {}", c.len().to_string());
+                response.headers.insert(CONTENT_LENGTH_HEADER.into(), c.len().to_string());
+                println!("Respons len: {:?}", c);
+                response.content = Some(c);
+                response.headers.insert(CONTENT_ENCODING_HEADER.into(), "gzip".into());
+            }
+        }
+    }
+    response
+}
+
 
 fn handle_connection(stream: TcpStream, config: &Cli) {
     let request = Request::from_stream(&stream).unwrap();
@@ -340,7 +363,7 @@ fn handle_connection(stream: TcpStream, config: &Cli) {
                             .headers
                             .insert("Content-Length".into(), format!("{}", echo_word.len()));
 
-                        response.content = Some(echo_word.to_owned());
+                        response.content = Some(echo_word.as_bytes().into());
                     } else if path.starts_with("/user-agent") {
                         response
                             .headers
@@ -351,7 +374,7 @@ fn handle_connection(stream: TcpStream, config: &Cli) {
                         );
 
                         response.content =
-                            Some(request.headers.get("User-Agent").unwrap().to_owned());
+                            Some(request.headers.get("User-Agent").unwrap().as_bytes().into());
                     } else if path.starts_with("/files") {
                         let path_split = path[1..].split_once('/');
 
@@ -374,7 +397,7 @@ fn handle_connection(stream: TcpStream, config: &Cli) {
                                                     "Content-Length".into(),
                                                     format!("{}", data.len()),
                                                 );
-                                                response.content = Some(data)
+                                                response.content = Some(data.as_bytes().into())
                                             }
                                             Err(_) => response.http_code = HttpCode::NotFound,
                                         };
@@ -449,6 +472,7 @@ fn handle_connection(stream: TcpStream, config: &Cli) {
                                             match file.write_all(
                                                 request
                                                     .body
+                                                    .as_ref()
                                                     .expect("No file data to upload.")
                                                     .as_bytes(),
                                             ) {
@@ -501,5 +525,6 @@ fn handle_connection(stream: TcpStream, config: &Cli) {
             }
         }
     }
+    response = output_middleware(&request, response);
     response.write_to_stream(&stream).unwrap();
 }
