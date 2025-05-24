@@ -321,7 +321,7 @@ impl Response {
 
 fn output_middleware(request: &Request, mut response: Response) -> Response {
     if let Some(encoding) = request.headers.get("Accept-Encoding") {
-        if encoding == "gzip" {
+        if encoding.split(",").map(|v| v.trim()).any(|v| v == "gzip") {
             // response.headers.insert("Content-Type".into(), "text/plain".into());
             let mut compressed_content = GzEncoder::new(Vec::new(), Compression::default());
             if let Some(content) = &response.content {
